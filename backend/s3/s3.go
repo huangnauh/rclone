@@ -2540,6 +2540,7 @@ type Options struct {
 	NoHeadObject          bool                 `config:"no_head_object"`
 	Enc                   encoder.MultiEncoder `config:"encoding"`
 	DisableHTTP2          bool                 `config:"disable_http2"`
+	DisableProxy          bool                 `config:"disable_proxy"`
 	DownloadURL           string               `config:"download_url"`
 	DirectoryMarkers      bool                 `config:"directory_markers"`
 	UseMultipartEtag      fs.Tristate          `config:"use_multipart_etag"`
@@ -2708,6 +2709,9 @@ func getClient(ctx context.Context, opt *Options) *http.Client {
 	t := fshttp.NewTransportCustom(ctx, func(t *http.Transport) {
 		if opt.DisableHTTP2 {
 			t.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+		}
+		if opt.DisableProxy {
+			t.Proxy = nil
 		}
 	})
 	return &http.Client{

@@ -4470,7 +4470,7 @@ func (f *Fs) itemToDirEntry(ctx context.Context, remote string, object *types.Ob
 		if object.Size != nil {
 			size = *object.Size
 		}
-		d := fs.NewDir(remote, time.Time{}).SetSize(size)
+		d := fs.NewDir(remote, time.Now()).SetSize(size)
 		return d, nil
 	}
 	o, err := f.newObjectWithInfo(ctx, remote, object, versionID)

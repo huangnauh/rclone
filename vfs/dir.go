@@ -529,9 +529,28 @@ func (d *Dir) DelVirtual(leaf string) {
 	d.delObject(leaf)
 }
 
+func (d *Dir) pollOnce() {
+	defer func() {
+		// We should never panic here
+		_ = recover()
+	}()
+	fs.Debugf(d.path, "Polling directory")
+	d._readRealDir(true)
+}
+
 // read the directory and sets d.items - must be called with the lock held
 func (d *Dir) _readDir() error {
+	if d.read.IsZero() {
+		return d._readRealDir(false)
+	}
 	when := time.Now()
+	if d.vfs.Opt.PollInterval > 0 {
+		if when.Sub(d.read) > time.Duration(d.vfs.Opt.PollInterval) {
+			d.read = when
+			go d.pollOnce()
+		}
+		return nil
+	}
 	if age, stale := d._age(when); stale {
 		if age != 0 {
 			fs.Debugf(d.path, "Re-reading directory (%v old)", age)
@@ -539,6 +558,10 @@ func (d *Dir) _readDir() error {
 	} else {
 		return nil
 	}
+	return d._readRealDir(false)
+}
+
+func (d *Dir) _readRealDir(lock bool) error {
 	entries, err := list.DirSorted(context.TODO(), d.f, false, d.path)
 	if err == fs.ErrorDirNotFound {
 		// We treat directory not found as empty because we
@@ -576,11 +599,14 @@ func (d *Dir) _readDir() error {
 		entries = filteredEntries
 	}
 
+	if lock {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+	}
 	err = d._readDirFromEntries(entries, nil, time.Time{})
 	if err != nil {
 		return err
 	}
-
 	d.read = time.Now()
 	d.cleanupTimer.Reset(time.Duration(d.vfs.Opt.DirCacheTime * 2))
 

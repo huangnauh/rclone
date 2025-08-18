@@ -109,7 +109,14 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 // Remove candidate objects selected by ACTION policy
 func (o *Object) Remove(ctx context.Context) error {
 	entries, err := o.fs.actionEntries(o.candidates()...)
-	if err != nil {
+	if err == fs.ErrorPermissionDenied {
+		if o.fs.deleteMark != nil {
+			err = o.fs.deleteMark.AddDeleteMark(ctx, o.Object.Remote())
+			if err != nil {
+				return err
+			}
+		}
+	} else if err != nil {
 		return err
 	}
 	errs := Errors(make([]error, len(entries)))

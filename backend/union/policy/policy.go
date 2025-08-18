@@ -23,7 +23,7 @@ type Policy interface {
 	Create(ctx context.Context, upstreams []*upstream.Fs, path string) ([]*upstream.Fs, error)
 
 	// Search category policy, governing the access to files and directories
-	Search(ctx context.Context, upstreams []*upstream.Fs, path string) (*upstream.Fs, error)
+	// Search(ctx context.Context, upstreams []*upstream.Fs, path string) (*upstream.Fs, error)
 
 	// ActionEntries is ACTION category policy but receiving a set of candidate entries
 	ActionEntries(entries ...upstream.Entry) ([]upstream.Entry, error)
@@ -113,6 +113,7 @@ func findEntry(ctx context.Context, f fs.Fs, remote string) fs.DirEntry {
 	found := false
 	for _, e := range entries {
 		eRemote := e.Remote()
+		// eRemote = strings.TrimSuffix(eRemote, fs.DeleteSuffix)
 		if f.Features().CaseInsensitive {
 			found = strings.EqualFold(remote, eRemote)
 		} else {

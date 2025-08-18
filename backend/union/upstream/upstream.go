@@ -2,11 +2,13 @@
 package upstream
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"math"
+	"path"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,6 +18,7 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/cache"
 	"github.com/rclone/rclone/fs/fspath"
+	"github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/fs/operations"
 )
 
@@ -32,6 +35,7 @@ type Fs struct {
 	Opt         *common.Options
 	writable    bool
 	creatable   bool
+	deleteMark  bool          // if the upstream supports delete mark
 	usage       *fs.Usage     // Cache the usage
 	cacheTime   time.Duration // cache duration
 	cacheExpiry atomic.Int64  // usage cache expiry time
@@ -92,6 +96,9 @@ func New(ctx context.Context, remote, root string, opt *common.Options) (*Fs, er
 	} else if strings.HasSuffix(fsPath, ":writeback") {
 		f.writeback = true
 		fsPath = fsPath[0 : len(fsPath)-len(":writeback")]
+	} else if strings.HasSuffix(fsPath, ":deletemark") {
+		f.deleteMark = true
+		fsPath = fsPath[0 : len(fsPath)-len(":deletemark")]
 	}
 	remote = configName + fsPath
 	rFs, err := cache.Get(ctx, remote)
@@ -110,26 +117,41 @@ func New(ctx context.Context, remote, root string, opt *common.Options) (*Fs, er
 }
 
 // Prepare the configured upstreams as a group
-func Prepare(fses []*Fs) error {
+func Prepare(fses []*Fs) (*Fs, error) {
 	writebacks := 0
+	deleteMarks := 0
 	var writebackFs *Fs
+	var deleteMarkFs *Fs
 	for _, f := range fses {
 		if f.writeback {
 			writebackFs = f
 			writebacks++
 		}
+		if f.deleteMark {
+			deleteMarkFs = f
+			deleteMarks++
+		}
 	}
+
+	if deleteMarks > 0 && writebacks > 0 {
+		return nil, fmt.Errorf("cannot have both :deletemark and :writeback")
+	} else if deleteMarks > 1 {
+		return nil, fmt.Errorf("can only have 1 :deletemark not %d", deleteMarks)
+	} else if deleteMarks > 0 {
+		return deleteMarkFs, nil
+	}
+
 	if writebacks == 0 {
-		return nil
+		return nil, nil
 	} else if writebacks > 1 {
-		return fmt.Errorf("can only have 1 :writeback not %d", writebacks)
+		return nil, fmt.Errorf("can only have 1 :writeback not %d", writebacks)
 	}
 	for _, f := range fses {
 		if !f.writeback {
 			f.writebackFs = writebackFs
 		}
 	}
-	return nil
+	return nil, nil
 }
 
 // WrapDirectory wraps an fs.Directory to include the info
@@ -185,6 +207,10 @@ func (o *Object) UnWrap() fs.Object {
 	return o.Object
 }
 
+func (o *Object) IsDelete() bool {
+	return strings.HasSuffix(o.Object.Remote(), fs.DeleteSuffix)
+}
+
 // IsCreatable return if the fs is allowed to create new objects
 func (f *Fs) IsCreatable() bool {
 	return f.creatable
@@ -193,6 +219,59 @@ func (f *Fs) IsCreatable() bool {
 // IsWritable return if the fs is allowed to write
 func (f *Fs) IsWritable() bool {
 	return f.writable
+}
+
+func (f *Fs) SupportDeleteMark() bool {
+	return f.deleteMark
+}
+
+func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
+	if f.RootFs == nil {
+		return nil, fs.ErrorObjectNotFound
+	}
+	o, err := f.Fs.NewObject(ctx, remote)
+	if err != nil {
+		if f.SupportDeleteMark() && err == fs.ErrorObjectNotFound {
+			var derr error
+			o, derr = f.Fs.NewObject(ctx, remote+fs.DeleteSuffix)
+			if derr != nil {
+				fs.Errorf(f, "Upstream Object %s not found, and find mark creation failed: %v", remote, derr)
+				return nil, err
+			}
+			fs.Debugf(f, "Upstream Object %s not found, and find delete mark %v", remote, o)
+			return o, fs.ErrorObjectNotFound
+		} else {
+			return nil, err
+		}
+	}
+	return o, nil
+}
+
+func (f *Fs) Rmdir(ctx context.Context, dir string) error {
+	if f.SupportDeleteMark() {
+		return nil
+	}
+	return f.Fs.Rmdir(ctx, dir)
+}
+
+func (f *Fs) AddDeleteMark(ctx context.Context, p string) error {
+	if !f.SupportDeleteMark() {
+		return nil
+	}
+	deleteObj := object.NewStaticObjectInfo(p+fs.DeleteSuffix, time.Now(),
+		0, true, nil, f)
+	fs.Debugf(f, "Upstream AddDeleteMark %s", deleteObj)
+	dir := path.Dir(deleteObj.Remote())
+	err := f.Fs.Mkdir(ctx, dir)
+	if err != nil {
+		fs.Errorf(deleteObj, "Upstream AddDeleteMark Mkdir %s %s", dir, err)
+		return err
+	}
+	_, err = f.Fs.Put(ctx, bytes.NewReader(nil), deleteObj)
+	if err != nil {
+		fs.Errorf(f, "Upstream AddDeleteMark %s %s", deleteObj, err)
+	}
+	return err
 }
 
 // Put in to the remote path with the modTime given of the given size
@@ -247,6 +326,18 @@ func (f *Fs) PutStream(ctx context.Context, in io.Reader, src fs.ObjectInfo, opt
 		*f.usage.Objects++
 	}
 	return o, nil
+}
+
+func (o *Object) Remove(ctx context.Context) error {
+	err := o.Object.Remove(ctx)
+	if err != nil {
+		return err
+	}
+	fs.Debugf(o.f, "Upstream Remove %s", o.Object.Remote())
+	if o.IsDelete() {
+		return nil
+	}
+	return o.f.AddDeleteMark(ctx, o.Object.Remote())
 }
 
 // Update in to the object with the modTime given of the given size

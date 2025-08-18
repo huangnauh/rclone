@@ -73,6 +73,7 @@ type Fs struct {
 	opt          common.Options // options for this Fs
 	root         string         // the path we are working on
 	upstreams    []*upstream.Fs // slice of upstreams
+	deleteMark   *upstream.Fs   // upstream for delete mark
 	hashSet      hash.Set       // intersection of hash types
 	actionPolicy policy.Policy  // policy for ACTION
 	createPolicy policy.Policy  // policy for CREATE
@@ -85,19 +86,26 @@ func (f *Fs) wrapEntries(entries ...upstream.Entry) (entry, error) {
 	if err != nil {
 		return nil, err
 	}
+	deleteMark := false
+	if e.UpstreamFs().SupportDeleteMark() {
+		deleteMark = strings.HasSuffix(e.Remote(), fs.DeleteSuffix)
+	}
+	if deleteMark {
+		err = fs.ErrorObjectNotFound
+	}
 	switch e := e.(type) {
 	case *upstream.Object:
 		return &Object{
 			Object: e,
 			fs:     f,
 			co:     entries,
-		}, nil
+		}, err
 	case *upstream.Directory:
 		return &Directory{
 			Directory: e,
 			fs:        f,
 			cd:        entries,
-		}, nil
+		}, err
 	default:
 		return nil, fmt.Errorf("unknown object type %T", e)
 	}
@@ -136,9 +144,10 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	}
 	errs := Errors(make([]error, len(upstreams)))
 	multithread(len(upstreams), func(i int) {
-		err := upstreams[i].Rmdir(ctx, dir)
+		upstream := upstreams[i]
+		err := upstream.Rmdir(ctx, dir)
 		if err != nil {
-			errs[i] = fmt.Errorf("%s: %w", upstreams[i].Name(), err)
+			errs[i] = fmt.Errorf("%s: %w", upstream.Name(), err)
 		}
 	})
 	return errs.Err()
@@ -371,6 +380,9 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 			}
 		}
 	})
+	if errs.Err() != nil {
+		return nil, errs.Err()
+	}
 	var en []upstream.Entry
 	for _, o := range objs {
 		if o != nil {
@@ -378,10 +390,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		}
 	}
 	e, err := f.wrapEntries(en...)
-	if err != nil {
-		return nil, err
-	}
-	return e.(*Object), errs.Err()
+	return e.(*Object), err
 }
 
 // DirMove moves src, srcRemote to this remote at dstRemote
@@ -586,21 +595,33 @@ func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, stream bo
 	return e.(*Object), err
 }
 
+func (f *Fs) putStream(ctx context.Context, in io.Reader, src fs.ObjectInfo, stream bool, options ...fs.OpenOption) (fs.Object, error) {
+	fs.Debugf(f, "Union putStream %s", src)
+	o, err := f.NewObject(ctx, src.Remote())
+	switch err {
+	case nil:
+		return o, o.Update(ctx, in, src, options...)
+	case fs.ErrorObjectNotFound:
+		if o != nil {
+			// remove delete-mark object
+			err = o.Remove(ctx)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return f.put(ctx, in, src, stream, options...)
+	default:
+		return nil, err
+	}
+}
+
 // Put in to the remote path with the modTime given of the given size
 //
 // May create the object even if it returns an error - if so
 // will return the object and the error, otherwise will return
 // nil and the error
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	o, err := f.NewObject(ctx, src.Remote())
-	switch err {
-	case nil:
-		return o, o.Update(ctx, in, src, options...)
-	case fs.ErrorObjectNotFound:
-		return f.put(ctx, in, src, false, options...)
-	default:
-		return nil, err
-	}
+	return f.putStream(ctx, in, src, false, options...)
 }
 
 // PutStream uploads to the remote path with the modTime given of indeterminate size
@@ -609,15 +630,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 // will return the object and the error, otherwise will return
 // nil and the error
 func (f *Fs) PutStream(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	o, err := f.NewObject(ctx, src.Remote())
-	switch err {
-	case nil:
-		return o, o.Update(ctx, in, src, options...)
-	case fs.ErrorObjectNotFound:
-		return f.put(ctx, in, src, true, options...)
-	default:
-		return nil, err
-	}
+	return f.putStream(ctx, in, src, true, options...)
 }
 
 // About gets quota information from the Fs
@@ -788,6 +801,9 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 		}
 		objs[i] = u.WrapObject(o)
 	})
+	if errs.Err() != nil {
+		return nil, errs.Err()
+	}
 	var entries []upstream.Entry
 	for _, o := range objs {
 		if o != nil {
@@ -798,10 +814,7 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 		return nil, fs.ErrorObjectNotFound
 	}
 	e, err := f.wrapEntries(entries...)
-	if err != nil {
-		return nil, err
-	}
-	return e.(*Object), errs.Err()
+	return e.(*Object), err
 }
 
 // Precision is the greatest Precision of all upstreams
@@ -842,12 +855,19 @@ func (f *Fs) mergeDirEntries(entriesList [][]upstream.Entry) (fs.DirEntries, err
 			if f.Features().CaseInsensitive {
 				remote = strings.ToLower(remote)
 			}
+			if entry.UpstreamFs().SupportDeleteMark() {
+				remote = strings.TrimSuffix(remote, fs.DeleteSuffix)
+			}
+			fs.Debugf(f, "merger entry %s %s", entry, remote)
 			entryMap[remote] = append(entryMap[remote], entry)
 		}
 	}
 	var entries fs.DirEntries
 	for path := range entryMap {
 		e, err := f.wrapEntries(entryMap[path]...)
+		if err == fs.ErrorObjectNotFound {
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -955,7 +975,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 			f.root = ""
 		}
 	}
-	err = upstream.Prepare(f.upstreams)
+	f.deleteMark, err = upstream.Prepare(f.upstreams)
 	if err != nil {
 		return nil, err
 	}
